@@ -2119,6 +2119,25 @@ var _ = Describe("Provisioning", func() {
 			ExpectNotScheduled(ctx, env.Client, invalidPod)
 			ExpectScheduled(ctx, env.Client, pod)
 		})
+		It("should not schedule a pod whose volume topology lookup fails during scheduling", func() {
+			volumeName := "test-volume"
+			persistentVolumeClaim := test.PersistentVolumeClaim(test.PersistentVolumeClaimOptions{VolumeName: volumeName})
+			persistentVolume := test.PersistentVolume(test.PersistentVolumeOptions{
+				ObjectMeta: metav1.ObjectMeta{Name: volumeName},
+			})
+			ExpectApplied(ctx, env.Client, test.NodePool(), persistentVolumeClaim, persistentVolume)
+			pod := test.UnschedulablePod(test.PodOptions{
+				PersistentVolumeClaims: []string{persistentVolumeClaim.Name},
+			})
+			// Validation reads the PersistentVolume twice before the volume topology lookup reads it. Fail the lookup's
+			// read so the pod passes validation and then errors during the lookup.
+			failingProv := provisioning.NewProvisioner(&failSecondPVGet{Client: env.Client}, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), predictionStore)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, failingProv, pod)
+			ExpectNotScheduled(ctx, env.Client, pod)
+			other := test.UnschedulablePod()
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, failingProv, other)
+			ExpectScheduled(ctx, env.Client, other)
+		})
 		It("should schedule valid pods when a pod with an invalid pvc is encountered (volume name)", func() {
 			invalidVolumeName := "invalid-volume-name"
 			persistentVolumeClaim := test.PersistentVolumeClaim(test.PersistentVolumeClaimOptions{VolumeName: invalidVolumeName})
@@ -3564,4 +3583,21 @@ func AddInstanceResources(instanceTypes []*cloudprovider.InstanceType, resources
 		}),
 	))
 	return instanceTypes
+}
+
+// failSecondPVGet fails the second Get of a PersistentVolume, so a read that succeeds during
+// validation can fail during the volume topology lookup.
+type failSecondPVGet struct {
+	client.Client
+	pvGets int
+}
+
+func (c *failSecondPVGet) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.PersistentVolume); ok {
+		c.pvGets++
+		if c.pvGets == 3 {
+			return fmt.Errorf("injected persistent volume lookup failure")
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }

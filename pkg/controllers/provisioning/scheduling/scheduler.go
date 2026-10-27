@@ -102,9 +102,19 @@ type options struct {
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
 	creditReservationCapacity map[string]int
+	// volumeTopologyErrors holds the pods whose volume topology lookup failed, keyed by UID. They are reported as
+	// pod errors instead of being scheduled without their volume requirements.
+	volumeTopologyErrors map[types.UID]error
 }
 
 type Options = option.Function[options]
+
+// VolumeTopologyErrors reports the pods whose volume topology lookup failed. Solve does not schedule them.
+var VolumeTopologyErrors = func(errs map[types.UID]error) Options {
+	return func(opts *options) {
+		opts.volumeTopologyErrors = errs
+	}
+}
 
 var DisableReservedCapacityFallback = func(opts *options) {
 	opts.reservedOfferingMode = ReservedOfferingModeStrict
@@ -241,6 +251,7 @@ func NewScheduler(
 		}
 	}
 	s.deletingNodeNames = deletingNodeNames
+	s.volumeTopologyErrors = resolved.volumeTopologyErrors
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
 	return s
 }
@@ -285,6 +296,7 @@ type Scheduler struct {
 	minValuesPolicy           karpopts.MinValuesPolicy
 	numConcurrentReconciles   int
 	deletingNodeNames         sets.Set[string]
+	volumeTopologyErrors      map[types.UID]error
 
 	// allocator simulates DRA device allocation for pods with ResourceClaims. It is nil when DRA support is disabled.
 	allocator *dynamicresources.Allocator
@@ -484,6 +496,16 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 	// had 5xA pods and 5xB pods were they have a zonal topology spread, but A can only go in one zone and B in another.
 	// We need to schedule them alternating, A, B, A, B, .... and this solution also solves that as well.
 	podErrors := map[*corev1.Pod]error{}
+	// Pods whose volume topology lookup failed are reported as pod errors, not scheduled without their volume requirements.
+	schedulable := make([]*corev1.Pod, 0, len(pods))
+	for _, p := range pods {
+		if err, failed := s.volumeTopologyErrors[p.UID]; failed {
+			podErrors[p] = err
+			continue
+		}
+		schedulable = append(schedulable, p)
+	}
+	pods = schedulable
 	// Reset the metric for the controller, so we don't keep old ids around
 	UnschedulablePodsCount.DeletePartialMatch(map[string]string{ControllerLabel: injection.GetControllerName(ctx)})
 	PendingPodsByEffectiveZone.DeletePartialMatch(map[string]string{ControllerLabel: injection.GetControllerName(ctx)})
